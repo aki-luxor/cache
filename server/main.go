@@ -112,6 +112,62 @@ func main() {
    http.HandleFunc("/caches", srv.handleCaches)
    http.HandleFunc("/upload/", srv.handleUpload)
    http.HandleFunc("/download/", srv.handleDownload)
+  // Twirp RPC: GetCacheEntryDownloadURL
+  http.HandleFunc(
+    "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL",
+    func(w http.ResponseWriter, r *http.Request) {
+      log.Printf(">> TWIRP %s %s", r.Method, r.URL.Path)
+      if r.Method != "POST" {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+      }
+      // Auth guard same as /cache
+      token, ok := srv.requireAuth(w, r)
+      if !ok {
+        return
+      }
+      // Decode Twirp JSON body
+      var req struct {
+        Key         string   `json:"key"`
+        RestoreKeys []string `json:"restoreKeys"`
+        Version     string   `json:"version"`
+      }
+      if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        log.Printf("Malformed TWIRP request: %v", err)
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(errorResponse{Message: err.Error()})
+        return
+      }
+      // Lookup cache entry
+      srv.mu.Lock()
+      var matchedKey, downloadURL string
+      all := append([]string{req.Key}, req.RestoreKeys...)
+      for _, k := range all {
+        comp := k + "|" + req.Version
+        if e, found := srv.caches[comp]; found {
+          matchedKey = e.Key
+          downloadURL = e.ArchiveLocation
+          break
+        }
+      }
+      srv.mu.Unlock()
+      // Build Twirp response
+      resp := struct {
+        Ok                bool   `json:"ok"`
+        MatchedKey        string `json:"matchedKey,omitempty"`
+        SignedDownloadUrl string `json:"signedDownloadUrl,omitempty"`
+      }{}
+      if matchedKey == "" {
+        resp.Ok = false
+      } else {
+        resp.Ok = true
+        resp.MatchedKey = matchedKey
+        resp.SignedDownloadUrl = downloadURL
+      }
+      w.Header().Set("Content-Type", "application/json")
+      json.NewEncoder(w).Encode(resp)
+    },
+  )
    // serve Swagger spec and UI
    http.HandleFunc("/swagger.json", func(w http.ResponseWriter, r *http.Request) {
        w.Header().Set("Content-Type", "application/json")
