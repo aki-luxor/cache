@@ -122,7 +122,7 @@ func main() {
         return
       }
       // Auth guard same as /cache
-      token, ok := srv.requireAuth(w, r)
+      _, ok := srv.requireAuth(w, r)
       if !ok {
         return
       }
