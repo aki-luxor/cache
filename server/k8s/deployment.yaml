@@ -16,8 +16,7 @@ spec:
     spec:
       containers:
       - name: tenkicloud-cache-server
-        # Replace <IMAGE_URL> with your container image in your registry
-        image: <IMAGE_URL>
+        image: ghcr.io/aki-luxor/cache:130d21ce340a48bb08b3e934af934eb99b590b28
         ports:
         - containerPort: 8080
         env:

@@ -136,6 +136,7 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
         }
         const compressionMethod = yield utils.getCompressionMethod();
         let archivePath = '';
+        let cacheLocation = '';
         try {
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
@@ -153,6 +154,7 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
             // Download the cache from the cache entry
+            cacheLocation = cacheEntry.archiveLocation;
             yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, archivePath, options);
             if (core.isDebug()) {
                 yield (0, tar_1.listTar)(archivePath, compressionMethod);
@@ -170,6 +172,9 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
+                if (error.message.includes('Invalid URL')) {
+                    core.debug(`Cache URL: ${cacheLocation}`);
+                }
                 core.warning(`Failed to restore: ${error.message}`);
             }
         }
@@ -210,6 +215,7 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             checkKey(key);
         }
         let archivePath = '';
+        let cacheUrl = '';
         try {
             const twirpClient = cacheTwirpClient.internalCacheTwirpClient();
             const compressionMethod = yield utils.getCompressionMethod();
@@ -231,6 +237,7 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
             core.debug(`Archive path: ${archivePath}`);
             core.debug(`Starting download of archive to: ${archivePath}`);
+            cacheUrl = response.signedDownloadUrl;
             yield cacheHttpClient.downloadCache(response.signedDownloadUrl, archivePath, options);
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
@@ -248,6 +255,9 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
+                if (error.message.includes('Invalid URL')) {
+                    core.debug(`Cache URL: ${cacheUrl}`);
+                }
                 core.warning(`Failed to restore: ${error.message}`);
             }
         }
