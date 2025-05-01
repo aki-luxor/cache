@@ -1,11 +1,12 @@
 name: Publish Docker image to GHCR
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
     
-# /Users/aakashtewari/souce-code/luxor/cache/.github/workflows/docker-publish.yaml
+
 permissions:
   contents: read
   packages: write
@@ -24,6 +25,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+          cache-dependency-path: "server/go.sum"
+
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v3
