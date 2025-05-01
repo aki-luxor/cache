@@ -483,7 +483,6 @@ func (s *server) handleReserveCache(w http.ResponseWriter, r *http.Request, toke
 	record := &reserveRecord{
 		Key:         req.Key,
 		Version:     req.Version,
-		RunId:       req.RunId,
 		CacheId:     cacheId,
 		Token:       token,
 		Size:        req.CacheSize,
@@ -1211,7 +1210,6 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 	record := &reserveRecord{
 		Key:         req.Key,
 		Version:     req.Version,
-		RunId:       req.RunId,
 		CacheId:     cacheId,
 		Token:       token,
 		Size:        -1,
