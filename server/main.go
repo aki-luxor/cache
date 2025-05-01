@@ -47,6 +47,7 @@ type reserveResponse struct {
 // errorResponse standard error JSON.
 type errorResponse struct {
 	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
 }
 
 // commitRequest defines JSON body for commit cache API.
@@ -71,6 +72,8 @@ type cacheEntry struct {
 	ArchivePath     string
 	ArchiveLocation string
 	CreationTime    time.Time
+	Compression     string
+	Size            int64
 }
 
 // listResponse for GET /caches?key= listing.
@@ -85,6 +88,8 @@ type artifactCache struct {
 	CacheVersion string `json:"cacheVersion"`
 	Scope        string `json:"scope"`
 	CreationTime string `json:"creationTime"`
+	Size         int64  `json:"sizeOnDisk,omitempty"`
+	Compression  string `json:"compression,omitempty"`
 }
 
 func main() {
@@ -129,13 +134,13 @@ func main() {
 			log.Printf("DEBUG: Handling Twirp request for GetCacheEntryDownloadURL")
 			if r.Method != "POST" {
 				log.Printf("ERROR: Twirp: Method %s not allowed, expected POST", r.Method)
-				w.WriteHeader(http.StatusMethodNotAllowed)
+				writeTwirpError(w, "malformed", "Method not allowed, expected POST", http.StatusMethodNotAllowed)
 				return
 			}
 			// Auth guard same as /cache
 			token, ok := srv.requireAuth(w, r) // Pass token through requireAuth now
 			if !ok {
-				// requireAuth handles logging and response
+				// requireAuth handles logging and response (already JSON)
 				log.Printf("DEBUG: Twirp: Authentication failed.")
 				return
 			}
@@ -149,8 +154,7 @@ func main() {
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				log.Printf("ERROR: Twirp: Malformed request body: %v", err)
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(errorResponse{Message: "Malformed request: " + err.Error()})
+				writeTwirpError(w, "malformed", "Malformed request: "+err.Error(), http.StatusBadRequest)
 				log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
 				return
 			}
@@ -199,6 +203,12 @@ func main() {
 		},
 	)
 
+	// Twirp RPC: CreateCacheEntry (Reservation)
+	http.HandleFunc(
+		"/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
+		srv.handleTwirpCreateCacheEntry,
+	)
+
 	// serve Swagger spec and UI
 	http.HandleFunc("/swagger.json", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
@@ -243,11 +253,13 @@ func main() {
 
 // reserveRecord holds metadata from reserve phase, including which user token reserved it.
 type reserveRecord struct {
-	Key     string
-	Version string
-	RunId   string
-	CacheId int64
-	Token   string // Store the token used for reservation for ownership checks
+	Key         string
+	Version     string
+	RunId       string
+	CacheId     int64
+	Token       string
+	Size        int64
+	Compression string
 }
 
 // server holds in-memory storage and state.
@@ -255,10 +267,10 @@ type server struct {
 	storageDir  string
 	mu          sync.Mutex // Protects all maps and nextCacheID
 	nextCacheID int64
-	reserves    map[string]*reserveRecord // Key: uploadId
-	caches      map[string]*cacheEntry    // Key: key|version
-	byUpload    map[string]*cacheEntry    // Key: uploadId (for download lookup)
-	tokens      map[string]*tokenInfo     // Key: token string
+	reserves    map[string]*reserveRecord
+	caches      map[string]*cacheEntry
+	byUpload    map[string]*cacheEntry
+	tokens      map[string]*tokenInfo
 }
 
 // requireAuth validates the Bearer token.
@@ -381,6 +393,8 @@ func (s *server) handleListCaches(w http.ResponseWriter, r *http.Request, token 
 				CacheVersion: e.Version, // Include version in response
 				Scope:        "",        // Scope seems unused/fixed in original code
 				CreationTime: e.CreationTime.Format(time.RFC3339),
+				Size:         e.Size,
+				Compression:  e.Compression,
 			})
 		} else {
 			//log.Printf("DEBUG: handleListCaches: No match for key '%s' (composite: %s, entry key: %s)", key, compKey, e.Key) // Too verbose maybe
@@ -467,11 +481,13 @@ func (s *server) handleReserveCache(w http.ResponseWriter, r *http.Request, toke
 	s.nextCacheID++
 	// Record reserve with user token for ownership check during commit/upload
 	record := &reserveRecord{
-		Key:     req.Key,
-		Version: req.Version,
-		RunId:   req.RunId,
-		CacheId: cacheId,
-		Token:   token, // Store the owning token
+		Key:         req.Key,
+		Version:     req.Version,
+		RunId:       req.RunId,
+		CacheId:     cacheId,
+		Token:       token,
+		Size:        req.CacheSize,
+		Compression: "gzip",
 	}
 	s.reserves[uploadId] = record
 	s.mu.Unlock()
@@ -727,9 +743,14 @@ func (s *server) handleCommit(w http.ResponseWriter, r *http.Request) {
 	// --- Assemble the final archive ---
 	partsDir := filepath.Join(s.storageDir, req.UploadId)
 	// Use UploadId in filename to avoid collisions if keys/versions are reused quickly
-	finalFilename := fmt.Sprintf("%s-%s-%s.tar.gz", sanitizeFilename(reserve.Key), sanitizeFilename(reserve.Version), req.UploadId)
+	// Determine file extension based on stored compression type
+	fileExtension := ".tar.gz"
+	if reserve.Compression == "zstd" {
+		fileExtension = ".tar.zst"
+	}
+	finalFilename := fmt.Sprintf("%s-%s-%s%s", sanitizeFilename(reserve.Key), sanitizeFilename(reserve.Version), req.UploadId, fileExtension)
 	finalPath := filepath.Join(s.storageDir, finalFilename)
-	log.Printf("DEBUG: handleCommit: Assembling final archive at: %s", finalPath)
+	log.Printf("DEBUG: handleCommit: Assembling final archive at: %s (Compression: %s)", finalPath, reserve.Compression)
 
 	out, err := os.Create(finalPath)
 	if err != nil {
@@ -799,6 +820,8 @@ func (s *server) handleCommit(w http.ResponseWriter, r *http.Request) {
 		ArchivePath:     finalPath, // Store the actual file path
 		ArchiveLocation: downloadURL, // Store the URL to serve
 		CreationTime:    time.Now().UTC(),
+		Compression:     reserve.Compression,
+		Size:            req.Size,
 	}
 	compositeKey := reserve.Key + "|" + reserve.Version
 
@@ -817,8 +840,8 @@ func (s *server) handleCommit(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	log.Printf("DEBUG: handleCommit: Released lock after committing state")
 
-	log.Printf("INFO: handleCommit: Committed cache: CacheId=%d, Key='%s', Version='%s', Size=%d, Path=%s",
-		entry.CacheId, entry.Key, entry.Version, req.Size, entry.ArchivePath)
+	log.Printf("INFO: handleCommit: Committed cache: CacheId=%d, Key='%s', Version='%s', Size=%d, Path=%s, Compression='%s'",
+		entry.CacheId, entry.Key, entry.Version, req.Size, entry.ArchivePath, entry.Compression)
 
 	// --- Cleanup Uploaded Parts ---
 	log.Printf("DEBUG: handleCommit: Attempting to remove parts directory: %s", partsDir)
@@ -888,15 +911,19 @@ func (s *server) handleGetCache(w http.ResponseWriter, r *http.Request) {
 				ArchiveLocation string `json:"archiveLocation"`
 				CacheKey        string `json:"cacheKey"`
 				CacheVersion    string `json:"cacheVersion"`
-				Scope           string `json:"scope"` // Unused in original code
+				Scope           string `json:"scope"`
 				CreationTime    string `json:"creationTime"`
+				Compression     string `json:"compression"`
+				Size            int64  `json:"size,omitempty"`
 			}{
 				CacheId:         e.CacheId,
-				ArchiveLocation: e.ArchiveLocation, // This is the download URL
-				CacheKey:        e.Key,             // The matched key
+				ArchiveLocation: e.ArchiveLocation,
+				CacheKey:        e.Key,
 				CacheVersion:    e.Version,
-				Scope:           "", // Fixed empty value
+				Scope:           "",
 				CreationTime:    e.CreationTime.Format(time.RFC3339),
+				Compression:     e.Compression,
+				Size:            e.Size,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(resp)
@@ -1063,6 +1090,152 @@ func truncateToken(token string) string {
 		return token[:4] + "..." + token[len(token)-4:]
 	}
 	return token // Return as is if too short
+}
+
+// writeTwirpError is a helper to write JSON errors consistent with Twirp.
+func writeTwirpError(w http.ResponseWriter, code, msg string, httpStatus int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus) // Set appropriate HTTP status
+	json.NewEncoder(w).Encode(errorResponse{
+		Code:    code, // Twirp error code (e.g., "internal", "invalid_argument")
+		Message: msg,
+	})
+}
+
+// handleTwirpCreateCacheEntry implements the reservation logic for the Twirp endpoint.
+func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Request) {
+	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
+	log.Printf("DEBUG: Handling Twirp request for CreateCacheEntry")
+	if r.Method != "POST" {
+		log.Printf("ERROR: Twirp CreateCacheEntry: Method %s not allowed, expected POST", r.Method)
+		writeTwirpError(w, "malformed", "Method not allowed, expected POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token, ok := s.requireAuth(w, r)
+	if !ok {
+		log.Printf("DEBUG: Twirp CreateCacheEntry: Authentication failed.")
+		// requireAuth already wrote the error response
+		return
+	}
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Authentication successful for token prefix %s...", truncateToken(token))
+
+	// Decode Twirp JSON body for CreateCacheEntry
+	// Based on Actions Cache v2 protocol observation, seems simple: {key, version}
+	var req struct {
+		Key     string `json:"key"`
+		Version string `json:"version"`
+		// cacheSize is often unknown at reservation time in Actions Cache v2
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("ERROR: Twirp CreateCacheEntry: Malformed request body: %v", err)
+		writeTwirpError(w, "malformed", "Malformed request: "+err.Error(), http.StatusBadRequest)
+		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
+		return
+	}
+	if req.Key == "" || req.Version == "" {
+		log.Printf("ERROR: Twirp CreateCacheEntry: Request must contain 'key' and 'version'")
+		writeTwirpError(w, "invalid_argument", "Request must contain 'key' and 'version'", http.StatusBadRequest)
+		return
+	}
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Decoded request: Key='%s', Version='%s'", req.Key, req.Version)
+
+	// --- Quota Check (Harder without CacheSize upfront) ---
+	// Actions Cache v2 often doesn't know size until commit.
+	// We *could* enforce a max reserve size or skip the upfront size check here
+	// and rely solely on the check during commit. Let's skip upfront size check for Twirp path.
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Skipping upfront cache size quota check (size often unknown). Will check during commit.")
+
+	s.mu.Lock()
+	user, userFound := s.tokens[token]
+	s.mu.Unlock() // Release lock after reading user info
+
+	if !userFound {
+		log.Printf("ERROR: Twirp CreateCacheEntry: Token %s... passed auth but not found!", truncateToken(token))
+		writeTwirpError(w, "internal", "Internal server error: user token inconsistency", http.StatusInternalServerError)
+		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
+		return
+	}
+	// We still need the user object later for commit checks.
+
+	// --- Check if cache entry already exists ---
+	// Actions cache protocol: If exact match exists, return it immediately (no new reservation needed).
+	compositeKey := req.Key + "|" + req.Version
+	s.mu.Lock()
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Acquired lock check existing cache")
+	existingEntry, found := s.caches[compositeKey]
+	s.mu.Unlock()
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Released lock after check existing cache")
+
+	if found {
+		log.Printf("INFO: Twirp CreateCacheEntry: Cache HIT for Key='%s', Version='%s'. Returning existing CacheId: %d", req.Key, req.Version, existingEntry.CacheId)
+		// Respond similar to commit, indicating the cache ID
+		resp := struct {
+			CacheId int64 `json:"cacheId"` // Actions Cache expects cacheId
+		}{CacheId: existingEntry.CacheId}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		log.Printf("DEBUG: << Response END: %s %s Status: %d (Cache Hit)", r.Method, r.URL.Path, http.StatusOK) // 200 OK for existing cache
+		return
+	}
+	log.Printf("DEBUG: Twirp CreateCacheEntry: No existing cache found for Key='%s', Version='%s'. Proceeding with reservation.", req.Key, req.Version)
+
+	// --- Generate Upload ID and Reserve ---
+	// We still need an uploadId internally to manage the upload process.
+	uploadId, err := newUploadId()
+	if err != nil {
+		log.Printf("ERROR: Twirp CreateCacheEntry: Failed to generate upload ID: %v", err)
+		writeTwirpError(w, "internal", "Internal server error: failed to generate upload ID", http.StatusInternalServerError)
+		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Generated internal UploadId: %s", uploadId)
+
+	// --- Determine Compression Method ---
+	// Check headers like X-Actions-Cache-Compression-Method
+	compressionMethod := "gzip" // Default
+	clientCompression := r.Header.Get("X-Actions-Cache-Compression-Method")
+	if clientCompression == "zstd" {
+		compressionMethod = "zstd"
+		log.Printf("DEBUG: Twirp CreateCacheEntry: Detected client requesting zstd compression via header.")
+	} else if clientCompression != "" && clientCompression != "gzip" {
+		log.Printf("WARN: Twirp CreateCacheEntry: Received unsupported X-Actions-Cache-Compression-Method: %s. Defaulting to gzip.", clientCompression)
+	} else {
+		log.Printf("DEBUG: Twirp CreateCacheEntry: No specific compression requested or gzip requested. Using gzip.")
+	}
+
+	s.mu.Lock()
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Acquired lock to record reservation")
+	cacheId := s.nextCacheID
+	s.nextCacheID++
+	record := &reserveRecord{
+		Key:         req.Key,
+		Version:     req.Version,
+		RunId:       req.RunId,
+		CacheId:     cacheId,
+		Token:       token,
+		Size:        -1,
+		Compression: compressionMethod,
+	}
+	// Use the *numeric cacheId* as the key for reserves in the Twirp context?
+	// No, let's stick to uploadId for internal tracking of uploads, but return cacheId to the client.
+	s.reserves[uploadId] = record
+	s.mu.Unlock()
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Released lock after recording reservation")
+	log.Printf("INFO: Twirp CreateCacheEntry: Reserved cache: CacheId=%d (Internal UploadId=%s), Key='%s', Version='%s', Compression='%s', Token=%s...",
+		cacheId, uploadId, req.Key, req.Version, compressionMethod, truncateToken(token))
+
+	// --- Build Twirp Response ---
+	// Actions Cache CreateCacheEntry returns the cacheId
+	resp := struct {
+		CacheId int64 `json:"cacheId"`
+	}{CacheId: cacheId}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK) // 200 OK seems standard for successful reservation in Twirp
+	json.NewEncoder(w).Encode(resp)
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Responded with CacheId %d", cacheId)
+	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
 }
 
 // Helper for logging ETags array cleanly (optional)
