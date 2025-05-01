@@ -1146,8 +1146,9 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 	// and rely solely on the check during commit. Let's skip upfront size check for Twirp path.
 	log.Printf("DEBUG: Twirp CreateCacheEntry: Skipping upfront cache size quota check (size often unknown). Will check during commit.")
 
+	// Check token validity, needed for ownership checks later.
 	s.mu.Lock()
-	user, userFound := s.tokens[token]
+	_, userFound := s.tokens[token]
 	s.mu.Unlock() // Release lock after reading user info
 
 	if !userFound {
@@ -1156,7 +1157,6 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
 		return
 	}
-	// We still need the user object later for commit checks.
 
 	// --- Check if cache entry already exists ---
 	// Actions cache protocol: If exact match exists, return it immediately (no new reservation needed).
