@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tenkicloud-cache-server
+  labels:
+    app: tenkicloud-cache-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tenkicloud-cache-server
+  template:
+    metadata:
+      labels:
+        app: tenkicloud-cache-server
+    spec:
+      containers:
+      - name: tenkicloud-cache-server
+        # Replace <IMAGE_URL> with your container image in your registry
+        image: <IMAGE_URL>
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"

@@ -1,0 +1,73 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "TenkiCloud Cache API",
+    "version": "1.0.0"
+  },
+  "servers": [{ "url": "" }],
+  "paths": {
+    "/token": {
+      "post": {
+        "summary": "Generate a new token",
+        "requestBody": {
+          "description": "Optional quota in GB",
+          "content": {
+            "application/json": { "schema": { "type": "object", "properties": { "quotaGB": { "type": "integer" } } } }
+          }
+        },
+        "responses": { "200": { "description": "Token created", "content": { "application/json": {} } } }
+      }
+    },
+    "/caches": {
+      "get": {
+        "summary": "List caches for a key",
+        "parameters": [{ "name": "key", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "List of caches", "content": { "application/json": {} } } }
+      },
+      "post": {
+        "summary": "Reserve a cache",
+        "requestBody": {
+          "description": "Cache reservation parameters",
+          "content": {
+            "application/json": { "schema": { "type": "object" } }
+          }
+        },
+        "responses": { "200": { "description": "Reservation successful", "content": { "application/json": {} } } }
+      }
+    },
+    "/upload/{uploadId}/{partIndex}": {
+      "put": {
+        "summary": "Upload a cache chunk",
+        "parameters": [
+          { "name": "uploadId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "partIndex", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "Chunk uploaded" } }
+      }
+    },
+    "/caches/commit": {
+      "post": {
+        "summary": "Commit a reserved cache",
+        "requestBody": { "content": { "application/json": {} } },
+        "responses": { "200": { "description": "Cache committed", "content": { "application/json": {} } } }
+      }
+    },
+    "/cache": {
+      "get": {
+        "summary": "Get a cache entry",
+        "parameters": [
+          { "name": "keys", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Cache entry found", "content": { "application/json": {} } }, "204": { "description": "Cache not found" } }
+      }
+    },
+    "/download/{uploadId}": {
+      "get": {
+        "summary": "Download the cache archive",
+        "parameters": [{ "name": "uploadId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Binary archive" } }
+      }
+    }
+  }
+}
