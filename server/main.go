@@ -806,23 +806,25 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 		cacheId, uploadId, req.Key, req.Version, compressionMethod, truncateToken(token))
 
 	// --- Build Twirp Response ---
-	// Actions Cache CreateCacheEntry needs more than just cacheId if it's going to upload.
-	// Let's try returning a structure including a URL pointing to our PATCH endpoint.
+	// HACK: The @actions/cache client seems to fail even with a 200 OK and cacheId/URL.
+	// Let's try returning the structure from the *original REST /caches reserve* response,
+	// hoping the client library expects that structure regardless of the endpoint called.
 	origin := baseURL(r)
-	uploadURL := fmt.Sprintf("%s/artifactcache/%d", origin, cacheId) // URL for PATCH requests
+	// Generate a single URL pointing to the PATCH endpoint, mimicking the old multi-part structure.
+	patchURL := fmt.Sprintf("%s/artifactcache/%d", origin, cacheId)
+	urls := []string{patchURL}
 
-	resp := struct {
-		CacheId         int64  `json:"cacheId"`
-		SignedUploadUrl string `json:"signedUploadUrl,omitempty"` // Mimic GetDownload response structure field
-	}{
-		CacheId:         cacheId,
-		SignedUploadUrl: uploadURL,
-	}
+	// Use the REST response structure
+	response := reserveResponse{Result: reserveResult{
+		UploadId:      uploadId,      // Return the internal hex UploadId
+		PresignedUrls: urls,          // Return the URL for the PATCH endpoint
+		ChunkSize:     defaultChunkSize, // Return a plausible chunk size
+	}}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK) // 200 OK seems standard for successful reservation in Twirp
-	json.NewEncoder(w).Encode(resp)
-	log.Printf("DEBUG: Twirp CreateCacheEntry: Responded with CacheId %d", cacheId)
+	w.WriteHeader(http.StatusOK) // Stick with 200 OK for now
+	json.NewEncoder(w).Encode(response)
+	log.Printf("DEBUG: Twirp CreateCacheEntry: Responded with REST-like structure (UploadId: %s, URL: %s)", uploadId, patchURL)
 	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
 }
 
