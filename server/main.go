@@ -806,10 +806,18 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 		cacheId, uploadId, req.Key, req.Version, compressionMethod, truncateToken(token))
 
 	// --- Build Twirp Response ---
-	// Actions Cache CreateCacheEntry returns the cacheId
+	// Actions Cache CreateCacheEntry needs more than just cacheId if it's going to upload.
+	// Let's try returning a structure including a URL pointing to our PATCH endpoint.
+	origin := baseURL(r)
+	uploadURL := fmt.Sprintf("%s/artifactcache/%d", origin, cacheId) // URL for PATCH requests
+
 	resp := struct {
-		CacheId int64 `json:"cacheId"`
-	}{CacheId: cacheId}
+		CacheId         int64  `json:"cacheId"`
+		SignedUploadUrl string `json:"signedUploadUrl,omitempty"` // Mimic GetDownload response structure field
+	}{
+		CacheId:         cacheId,
+		SignedUploadUrl: uploadURL,
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK) // 200 OK seems standard for successful reservation in Twirp
