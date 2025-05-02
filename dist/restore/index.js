@@ -1594,10 +1594,10 @@ function getCacheServiceURL() {
     switch (version) {
         case 'v1':
             return (process.env['TENKI_CACHE_URL'] ||
-                process.env['ACTIONS_RESULTS_URL'] ||
+                process.env['TENKI_CACHE_URL'] ||
                 '');
         case 'v2':
-            return process.env['ACTIONS_RESULTS_URL'] || '';
+            return process.env['TENKI_CACHE_URL'] || '';
         default:
             throw new Error(`Unsupported cache service version: ${version}`);
     }
