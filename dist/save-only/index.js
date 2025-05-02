@@ -84,7 +84,7 @@ function checkKey(key) {
  * @returns boolean return true if Actions cache service feature is available, otherwise false
  */
 function isFeatureAvailable() {
-    return !!process.env['ACTIONS_CACHE_URL'];
+    return !!process.env['TENKI_CACHE_URL'];
 }
 exports.isFeatureAvailable = isFeatureAvailable;
 /**
@@ -1149,7 +1149,7 @@ function getRequestOptions() {
     return requestOptions;
 }
 function createHttpClient() {
-    const token = process.env['ACTIONS_RUNTIME_TOKEN'] || '';
+    const token = process.env['TENKI_RUNTIME_TOKEN'] || '';
     const bearerCredentialHandler = new auth_1.BearerCredentialHandler(token);
     return new http_client_1.HttpClient((0, user_agent_1.getUserAgentString)(), [bearerCredentialHandler], getRequestOptions());
 }
@@ -1552,9 +1552,9 @@ function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false)
 }
 exports.getCacheVersion = getCacheVersion;
 function getRuntimeToken() {
-    const token = process.env['ACTIONS_RUNTIME_TOKEN'];
+    const token = process.env['TENKI_RUNTIME_TOKEN'];
     if (!token) {
-        throw new Error('Unable to get the ACTIONS_RUNTIME_TOKEN env variable');
+        throw new Error('Unable to get the TENKI_RUNTIME_TOKEN env variable');
     }
     return token;
 }
@@ -1593,7 +1593,7 @@ function getCacheServiceURL() {
     // URL to use.
     switch (version) {
         case 'v1':
-            return (process.env['ACTIONS_CACHE_URL'] ||
+            return (process.env['TENKI_CACHE_URL'] ||
                 process.env['ACTIONS_RESULTS_URL'] ||
                 '');
         case 'v2':
