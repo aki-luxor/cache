@@ -2,7 +2,6 @@ package main
 
 import (
 	_ "embed"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -109,21 +108,20 @@ func main() {
 	}
 
 	srv := &server{
-		storageDir:  storageDir,
-		nextCacheID: 1,
-		reserves:    make(map[string]*reserveRecord),
-		caches:      make(map[string]*cacheEntry),
-		byUpload:    make(map[string]*cacheEntry),
-		tokens:      make(map[string]*tokenInfo),
+		storageDir:       storageDir,
+		nextCacheID:      1,
+		reserves:         make(map[string]*reserveRecord),
+		caches:           make(map[string]*cacheEntry),
+		byUpload:         make(map[string]*cacheEntry),
+		tokens:           make(map[string]*tokenInfo),
+		cacheIdToUploadId: make(map[int64]string),
 	}
 
 	log.Printf("INFO: Registering HTTP handlers...")
 	// token creation endpoint (no auth)
 	http.HandleFunc("/token", srv.handleTokenCreation)
 	http.HandleFunc("/cache", srv.handleGetCache)
-	http.HandleFunc("/caches/commit", srv.handleCommit)
 	http.HandleFunc("/caches", srv.handleCaches)
-	http.HandleFunc("/upload/", srv.handleUpload)
 	http.HandleFunc("/download/", srv.handleDownload)
 
 	// Twirp RPC: GetCacheEntryDownloadURL
@@ -209,6 +207,9 @@ func main() {
 		srv.handleTwirpCreateCacheEntry,
 	)
 
+	// Actions Artifact Cache API Endpoints (subset)
+	http.HandleFunc("/artifactcache/", srv.handleArtifactCache)
+
 	// serve Swagger spec and UI
 	http.HandleFunc("/swagger.json", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
@@ -264,13 +265,14 @@ type reserveRecord struct {
 
 // server holds in-memory storage and state.
 type server struct {
-	storageDir  string
-	mu          sync.Mutex // Protects all maps and nextCacheID
-	nextCacheID int64
-	reserves    map[string]*reserveRecord
-	caches      map[string]*cacheEntry
-	byUpload    map[string]*cacheEntry
-	tokens      map[string]*tokenInfo
+	storageDir       string
+	mu               sync.Mutex // Protects all maps and nextCacheID
+	nextCacheID      int64
+	reserves         map[string]*reserveRecord // Key: uploadId
+	caches           map[string]*cacheEntry    // Key: key|version
+	byUpload         map[string]*cacheEntry    // Key: uploadId (for download lookup)
+	tokens           map[string]*tokenInfo     // Key: token string
+	cacheIdToUploadId map[int64]string         // Key: cacheId, Value: uploadId
 }
 
 // requireAuth validates the Bearer token.
@@ -489,6 +491,8 @@ func (s *server) handleReserveCache(w http.ResponseWriter, r *http.Request, toke
 		Compression: "gzip",
 	}
 	s.reserves[uploadId] = record
+	// Store the mapping from cacheId back to uploadId
+	s.cacheIdToUploadId[cacheId] = uploadId
 	s.mu.Unlock()
 	log.Printf("DEBUG: handleReserveCache: Released lock after recording reservation")
 	log.Printf("INFO: handleReserveCache: Reserved cache: UploadId=%s, CacheId=%d, Key='%s', Version='%s', Size=%d, Token=%s...",
@@ -514,430 +518,6 @@ func (s *server) handleReserveCache(w http.ResponseWriter, r *http.Request, toke
 	json.NewEncoder(w).Encode(response)
 	log.Printf("DEBUG: handleReserveCache: Responded with reservation details for UploadId %s", uploadId)
 	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusCreated)
-}
-
-// handleUpload accepts PUTs to /upload/{uploadId}/{partIndex}.
-func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
-	if r.Method != "PUT" {
-		log.Printf("WARN: handleUpload: Method %s not allowed, expected PUT for %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Authenticate request - check token validity AND ownership of the uploadId
-	token, ok := s.requireAuth(w, r)
-	if !ok {
-		log.Printf("DEBUG: handleUpload: Authentication failed.")
-		log.Printf("DEBUG: << Response END: %s %s Status: %d (Unauthorized)", r.Method, r.URL.Path, http.StatusUnauthorized)
-		return
-	}
-	// Note: requireAuth only checks if token *exists*. We need to check if *this token* owns the uploadId.
-
-	// Parse path: /upload/{uploadId}/{partIndex}
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 3 || parts[0] != "upload" {
-		log.Printf("WARN: handleUpload: Invalid URL path format: %s", r.URL.Path)
-		w.WriteHeader(http.StatusNotFound) // Or BadRequest? NotFound seems reasonable.
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusNotFound)
-		return
-	}
-	uploadId := parts[1]
-	idxStr := parts[2]
-	idx, err := strconv.Atoi(idxStr)
-	if err != nil {
-		log.Printf("WARN: handleUpload: Invalid part index '%s' in path %s: %v", idxStr, r.URL.Path, err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Invalid part index"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
-		return
-	}
-	log.Printf("DEBUG: handleUpload: Parsed UploadId=%s, PartIndex=%d", uploadId, idx)
-
-	// Verify reserve exists and belongs to this token
-	s.mu.Lock()
-	log.Printf("DEBUG: handleUpload: Acquired lock to check reservation %s", uploadId)
-	reserve, reserveFound := s.reserves[uploadId]
-	s.mu.Unlock() // Release lock after reading reserve info
-	log.Printf("DEBUG: handleUpload: Released lock after checking reservation %s", uploadId)
-
-	if !reserveFound {
-		log.Printf("WARN: handleUpload: Reservation not found for UploadId %s", uploadId)
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Upload ID not found or expired"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusNotFound)
-		return
-	}
-	log.Printf("DEBUG: handleUpload: Found reservation for UploadId %s (Key: %s, Version: %s)", uploadId, reserve.Key, reserve.Version)
-
-	// Check ownership
-	if reserve.Token != token {
-		log.Printf("WARN: handleUpload: Token mismatch for UploadId %s. Request token %s... != Reserved token %s...",
-			uploadId, truncateToken(token), truncateToken(reserve.Token))
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Forbidden: Token does not match reservation owner"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusForbidden)
-		return
-	}
-	log.Printf("DEBUG: handleUpload: Token ownership verified for UploadId %s", uploadId)
-
-	// Create directory for upload parts if it doesn't exist
-	dir := filepath.Join(s.storageDir, uploadId)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("ERROR: handleUpload: Failed to create directory %s: %v", dir, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to create storage directory"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-		return
-	}
-	partPath := filepath.Join(dir, fmt.Sprintf("%d.part", idx))
-	log.Printf("DEBUG: handleUpload: Preparing to write to part file: %s", partPath)
-
-	f, err := os.Create(partPath)
-	if err != nil {
-		log.Printf("ERROR: handleUpload: Failed to create part file %s: %v", partPath, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to create part file"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-		return
-	}
-	defer f.Close() // Ensure file is closed
-
-	hash := md5.New() // Calculate MD5 hash for ETag
-	writer := io.MultiWriter(f, hash)
-
-	log.Printf("DEBUG: handleUpload: Copying request body to %s and calculating MD5...", partPath)
-	startTime := time.Now()
-	bytesWritten, err := io.Copy(writer, r.Body)
-	duration := time.Since(startTime)
-
-	if err != nil {
-		log.Printf("ERROR: handleUpload: Failed to copy request body to %s: %v", partPath, err)
-		// Attempt to remove partially written file
-		f.Close() // Close it first
-		_ = os.Remove(partPath)
-		log.Printf("DEBUG: handleUpload: Attempted cleanup of partial file %s", partPath)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to write part file"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-		return
-	}
-
-	etag := hex.EncodeToString(hash.Sum(nil))
-	log.Printf("INFO: handleUpload: Successfully wrote %d bytes to %s in %v. ETag: %s", bytesWritten, partPath, duration, etag)
-
-	w.Header().Set("ETag", "\""+etag+"\"") // Standard ETag format includes quotes
-	w.WriteHeader(http.StatusOK)
-	log.Printf("DEBUG: handleUpload: Responded OK for UploadId %s Part %d", uploadId, idx)
-	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
-}
-
-// handleCommit finalizes upload, assembles the archive, and updates cache state.
-func (s *server) handleCommit(w http.ResponseWriter, r *http.Request) {
-	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
-	if r.Method != "POST" {
-		log.Printf("WARN: handleCommit: Method %s not allowed, expected POST for %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Authenticate request
-	token, ok := s.requireAuth(w, r)
-	if !ok {
-		log.Printf("DEBUG: handleCommit: Authentication failed.")
-		log.Printf("DEBUG: << Response END: %s %s Status: %d (Unauthorized)", r.Method, r.URL.Path, http.StatusUnauthorized)
-		return
-	}
-	log.Printf("DEBUG: handleCommit: Authentication successful for token prefix %s...", truncateToken(token))
-
-	var req commitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("WARN: handleCommit: Failed to decode request body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Message: "invalid request: " + err.Error()})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
-		return
-	}
-	log.Printf("DEBUG: handleCommit: Decoded request: UploadId=%s, Size=%d, EtagsCount=%d", req.UploadId, req.Size, len(req.Etags))
-	// Maybe log first few ETags if needed: log.Printf("DEBUG: Etags (first few): %v", req.Etags[:min(len(req.Etags), 5)])
-
-	// --- Quota Check (again) and Reservation Lookup ---
-	s.mu.Lock()
-	log.Printf("DEBUG: handleCommit: Acquired lock for quota/reserve check (UploadId: %s)", req.UploadId)
-	user, userFound := s.tokens[token]
-	reserve, reserveFound := s.reserves[req.UploadId]
-	s.mu.Unlock() // Release lock after reading data
-	log.Printf("DEBUG: handleCommit: Released lock after quota/reserve check (UploadId: %s)", req.UploadId)
-
-	if !userFound {
-		// Should not happen
-		log.Printf("ERROR: handleCommit: Token %s... passed auth but not found during commit!", truncateToken(token))
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: user token inconsistency"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-		return
-	}
-	if !reserveFound {
-		log.Printf("WARN: handleCommit: Reservation not found for UploadId %s", req.UploadId)
-		// Check if it was already committed?
-		s.mu.Lock()
-		committedEntry, alreadyCommitted := s.byUpload[req.UploadId]
-		s.mu.Unlock()
-		if alreadyCommitted {
-			log.Printf("INFO: handleCommit: UploadId %s was already committed (CacheId: %d). Responding with existing CacheId.", req.UploadId, committedEntry.CacheId)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(struct{ CacheId int64 `json:"cacheId"`}{committedEntry.CacheId})
-			log.Printf("DEBUG: << Response END: %s %s Status: %d (Already Committed)", r.Method, r.URL.Path, http.StatusOK)
-			return
-		}
-		// If not committed and reserve not found, it's an error
-		w.WriteHeader(http.StatusNotFound) // Or BadRequest? Client might be sending invalid/old ID.
-		json.NewEncoder(w).Encode(errorResponse{Message: "Upload ID not found or expired"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusNotFound)
-		return
-	}
-	log.Printf("DEBUG: handleCommit: Found reservation for UploadId %s", req.UploadId)
-
-	// Check ownership again
-	if reserve.Token != token {
-		log.Printf("WARN: handleCommit: Token mismatch for UploadId %s. Request token %s... != Reserved token %s...",
-			req.UploadId, truncateToken(token), truncateToken(reserve.Token))
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Forbidden: Token does not match reservation owner"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusForbidden)
-		return
-	}
-	log.Printf("DEBUG: handleCommit: Token ownership verified for UploadId %s", req.UploadId)
-
-	// --- Quota check based on *committed* size ---
-	log.Printf("DEBUG: handleCommit: Checking final quota for token %s... (Quota: %d B, Used: %d B, Commit Size: %d B)", truncateToken(token), user.Quota, user.Used, req.Size)
-	// Per-file size limit check (using committed size)
-	if req.Size > user.Quota {
-		msg := fmt.Sprintf(
-			"Committed cache size of %d B (~%d MB) exceeds user quota of %d B (~%d MB)",
-			req.Size, req.Size/(1024*1024), user.Quota, user.Quota/(1024*1024))
-		log.Printf("WARN: handleCommit: Quota exceeded (final file size): %s", msg)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Message: msg})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
-		// Consider deleting uploaded parts if commit fails due to quota? Requires cleanup logic.
-		return
-	}
-	// Cumulative usage limit check (using committed size)
-	if user.Used+req.Size > user.Quota {
-		msg := fmt.Sprintf(
-			"Quota exceeded: current usage %d B (~%d MB) + committed %d B (~%d MB) > quota %d B (~%d MB)",
-			user.Used, user.Used/(1024*1024), req.Size, req.Size/(1024*1024), user.Quota, user.Quota/(1024*1024))
-		log.Printf("WARN: handleCommit: Quota exceeded (final cumulative): %s", msg)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Message: msg})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
-		// Consider deleting uploaded parts
-		return
-	}
-	log.Printf("DEBUG: handleCommit: Final quota check passed for token %s...", truncateToken(token))
-
-	// --- Assemble the final archive ---
-	partsDir := filepath.Join(s.storageDir, req.UploadId)
-	// Use UploadId in filename to avoid collisions if keys/versions are reused quickly
-	// Determine file extension based on stored compression type
-	fileExtension := ".tar.gz"
-	if reserve.Compression == "zstd" {
-		fileExtension = ".tar.zst"
-	}
-	finalFilename := fmt.Sprintf("%s-%s-%s%s", sanitizeFilename(reserve.Key), sanitizeFilename(reserve.Version), req.UploadId, fileExtension)
-	finalPath := filepath.Join(s.storageDir, finalFilename)
-	log.Printf("DEBUG: handleCommit: Assembling final archive at: %s (Compression: %s)", finalPath, reserve.Compression)
-
-	out, err := os.Create(finalPath)
-	if err != nil {
-		log.Printf("ERROR: handleCommit: Failed to create final archive file %s: %v", finalPath, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to create archive file"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-		return
-	}
-	defer out.Close() // Ensure output file is closed
-
-	var totalBytesWritten int64 = 0
-	expectedParts := len(req.Etags) // Assuming number of Etags matches number of uploaded parts
-	log.Printf("DEBUG: handleCommit: Starting assembly of %d parts from %s", expectedParts, partsDir)
-	startTime := time.Now()
-
-	for i := 0; i < expectedParts; i++ {
-		partFile := filepath.Join(partsDir, fmt.Sprintf("%d.part", i))
-		// log.Printf("DEBUG: handleCommit: Appending part %d: %s", i, partFile) // Can be very verbose
-		in, err := os.Open(partFile)
-		if err != nil {
-			log.Printf("ERROR: handleCommit: Failed to open part file %s: %v", partFile, err)
-			// Attempt cleanup of final file
-			out.Close()
-			_ = os.Remove(finalPath)
-			log.Printf("DEBUG: handleCommit: Attempted cleanup of partial archive %s", finalPath)
-			w.WriteHeader(http.StatusInternalServerError) // Indicate failure during assembly
-			json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to read cache part"})
-			log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-			return
-		}
-
-		bytesCopied, err := io.Copy(out, in)
-		in.Close() // Close input part file immediately after copy
-
-		if err != nil {
-			log.Printf("ERROR: handleCommit: Failed to copy part file %s to archive: %v", partFile, err)
-			// Attempt cleanup
-			out.Close()
-			_ = os.Remove(finalPath)
-			log.Printf("DEBUG: handleCommit: Attempted cleanup of partial archive %s", finalPath)
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(errorResponse{Message: "Internal server error: failed to assemble archive"})
-			log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusInternalServerError)
-			return
-		}
-		totalBytesWritten += bytesCopied
-		// log.Printf("DEBUG: handleCommit: Copied %d bytes from part %d", bytesCopied, i) // Verbose
-	}
-	duration := time.Since(startTime)
-	log.Printf("INFO: handleCommit: Successfully assembled archive %s (%d bytes written) in %v", finalPath, totalBytesWritten, duration)
-
-	// Optional: Verify final size matches committed size
-	if totalBytesWritten != req.Size {
-		log.Printf("WARN: handleCommit: Final assembled size %d bytes does not match committed size %d bytes for UploadId %s", totalBytesWritten, req.Size, req.UploadId)
-		// Decide how to handle this - maybe proceed but log, or fail? Let's proceed but warn.
-	}
-
-	// --- Update Cache State ---
-	origin := baseURL(r)
-	downloadURL := fmt.Sprintf("%s/download/%s", origin, req.UploadId) // Use UploadId for download lookup
-	entry := &cacheEntry{
-		Key:             reserve.Key,
-		Version:         reserve.Version,
-		RunId:           reserve.RunId,
-		CacheId:         reserve.CacheId,
-		ArchivePath:     finalPath, // Store the actual file path
-		ArchiveLocation: downloadURL, // Store the URL to serve
-		CreationTime:    time.Now().UTC(),
-		Compression:     reserve.Compression,
-		Size:            req.Size,
-	}
-	compositeKey := reserve.Key + "|" + reserve.Version
-
-	s.mu.Lock()
-	log.Printf("DEBUG: handleCommit: Acquired lock to commit cache entry and update state")
-	// Add to main cache map (key|version -> entry)
-	s.caches[compositeKey] = entry
-	// Add to lookup map (uploadId -> entry) for downloads
-	s.byUpload[req.UploadId] = entry
-	// Remove the reservation record
-	delete(s.reserves, req.UploadId)
-	// Update token usage (use req.Size as reported by client)
-	user = s.tokens[token] // Re-fetch user within lock
-	user.Used += req.Size
-	log.Printf("DEBUG: handleCommit: Updated token %s... usage. New Used: %d B", truncateToken(token), user.Used)
-	s.mu.Unlock()
-	log.Printf("DEBUG: handleCommit: Released lock after committing state")
-
-	log.Printf("INFO: handleCommit: Committed cache: CacheId=%d, Key='%s', Version='%s', Size=%d, Path=%s, Compression='%s'",
-		entry.CacheId, entry.Key, entry.Version, req.Size, entry.ArchivePath, entry.Compression)
-
-	// --- Cleanup Uploaded Parts ---
-	log.Printf("DEBUG: handleCommit: Attempting to remove parts directory: %s", partsDir)
-	err = os.RemoveAll(partsDir)
-	if err != nil {
-		log.Printf("WARN: handleCommit: Failed to remove parts directory %s after commit: %v", partsDir, err)
-	} else {
-		log.Printf("DEBUG: handleCommit: Successfully removed parts directory %s", partsDir)
-	}
-
-	// Respond with CacheId
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct{ CacheId int64 `json:"cacheId"`}{entry.CacheId})
-	log.Printf("DEBUG: handleCommit: Responded with CacheId %d", entry.CacheId)
-	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
-}
-
-// handleGetCache implements GET /cache?keys=...&version=... (cache lookup)
-func (s *server) handleGetCache(w http.ResponseWriter, r *http.Request) {
-	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
-	if r.Method != "GET" {
-		log.Printf("WARN: handleGetCache: Method %s not allowed, expected GET for %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Authenticate request
-	token, ok := s.requireAuth(w, r)
-	if !ok {
-		log.Printf("DEBUG: handleGetCache: Authentication failed.")
-		log.Printf("DEBUG: << Response END: %s %s Status: %d (Unauthorized)", r.Method, r.URL.Path, http.StatusUnauthorized)
-		return
-	}
-	log.Printf("DEBUG: handleGetCache: Authentication successful for token prefix %s...", truncateToken(token))
-
-	keysParam := r.URL.Query().Get("keys")
-	version := r.URL.Query().Get("version")
-	if keysParam == "" || version == "" {
-		log.Printf("WARN: handleGetCache: Missing required query parameters 'keys' and/or 'version'. Keys: '%s', Version: '%s'", keysParam, version)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Message: "Missing required query parameters: keys, version"})
-		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
-		return
-	}
-
-	keys := strings.Split(keysParam, ",")
-	log.Printf("DEBUG: handleGetCache: Looking for cache with Keys=%v, Version=%s", keys, version)
-
-	s.mu.Lock()
-	log.Printf("DEBUG: handleGetCache: Acquired lock for cache lookup")
-	defer s.mu.Unlock() // Use defer for safety within the loop/return
-	log.Printf("DEBUG: handleGetCache: Checking %d potential keys against %d cache entries", len(keys), len(s.caches))
-
-	for _, k := range keys {
-		trimmedKey := strings.TrimSpace(k)
-		if trimmedKey == "" {
-			continue
-		}
-		comp := trimmedKey + "|" + version
-		log.Printf("DEBUG: handleGetCache: Checking composite key: %s", comp)
-		if e, found := s.caches[comp]; found {
-			log.Printf("INFO: handleGetCache: Cache HIT for Key='%s', Version='%s'. Composite: %s. CacheId: %d, Location: %s",
-				trimmedKey, version, comp, e.CacheId, e.ArchiveLocation)
-			resp := struct {
-				CacheId         int64  `json:"cacheId"`
-				ArchiveLocation string `json:"archiveLocation"`
-				CacheKey        string `json:"cacheKey"`
-				CacheVersion    string `json:"cacheVersion"`
-				Scope           string `json:"scope"`
-				CreationTime    string `json:"creationTime"`
-				Compression     string `json:"compression"`
-				Size            int64  `json:"size,omitempty"`
-			}{
-				CacheId:         e.CacheId,
-				ArchiveLocation: e.ArchiveLocation,
-				CacheKey:        e.Key,
-				CacheVersion:    e.Version,
-				Scope:           "",
-				CreationTime:    e.CreationTime.Format(time.RFC3339),
-				Compression:     e.Compression,
-				Size:            e.Size,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
-			log.Printf("DEBUG: handleGetCache: Responded with cache hit details.")
-			log.Printf("DEBUG: << Response END: %s %s Status: %d (Cache Hit)", r.Method, r.URL.Path, http.StatusOK)
-			return // Found a match, return immediately
-		} else {
-			log.Printf("DEBUG: handleGetCache: Cache MISS for composite key: %s", comp)
-		}
-	}
-
-	// If loop completes without finding a match
-	log.Printf("INFO: handleGetCache: Cache MISS for all requested Keys=%v, Version=%s", keys, version)
-	w.WriteHeader(http.StatusNoContent) // 204 No Content indicates cache miss
-	log.Printf("DEBUG: << Response END: %s %s Status: %d (Cache Miss)", r.Method, r.URL.Path, http.StatusNoContent)
 }
 
 // handleDownload serves the combined archive at /download/{uploadId}.
@@ -1218,6 +798,8 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 	// Use the *numeric cacheId* as the key for reserves in the Twirp context?
 	// No, let's stick to uploadId for internal tracking of uploads, but return cacheId to the client.
 	s.reserves[uploadId] = record
+	// Store the mapping from cacheId back to uploadId
+	s.cacheIdToUploadId[cacheId] = uploadId
 	s.mu.Unlock()
 	log.Printf("DEBUG: Twirp CreateCacheEntry: Released lock after recording reservation")
 	log.Printf("INFO: Twirp CreateCacheEntry: Reserved cache: CacheId=%d (Internal UploadId=%s), Key='%s', Version='%s', Compression='%s', Token=%s...",
@@ -1243,3 +825,391 @@ func (s *server) handleTwirpCreateCacheEntry(w http.ResponseWriter, r *http.Requ
 // 	}
 // 	return b
 // }
+
+// --- New Handlers for Actions Artifact Cache API --- //
+
+// handleArtifactCache routes PATCH and POST requests for /artifactcache/{cacheId}/*
+func (s *server) handleArtifactCache(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/artifactcache/"), "/")
+	if len(pathParts) < 1 || pathParts[0] == "" {
+		log.Printf("WARN: handleArtifactCache: Invalid path format: %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errorResponse{Message: "Invalid request path, expected /artifactcache/{cacheId}/..."})
+		return
+	}
+
+	cacheIdStr := pathParts[0]
+	cacheId, err := strconv.ParseInt(cacheIdStr, 10, 64)
+	if err != nil {
+		log.Printf("WARN: handleArtifactCache: Invalid cacheId '%s' in path: %v", cacheIdStr, err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errorResponse{Message: "Invalid cacheId in request path"})
+		return
+	}
+
+	// Route based on method and remaining path parts
+	if r.Method == "PATCH" && len(pathParts) == 1 {
+		s.handleArtifactUploadChunk(w, r, cacheId)
+	} else if r.Method == "POST" && len(pathParts) == 2 && pathParts[1] == "commit" {
+		s.handleArtifactCommit(w, r, cacheId)
+	} else {
+		log.Printf("WARN: handleArtifactCache: Unsupported method/path combination: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// handleArtifactUploadChunk handles PATCH /artifactcache/{cacheId} for uploading chunks
+func (s *server) handleArtifactUploadChunk(w http.ResponseWriter, r *http.Request, cacheId int64) {
+	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
+
+	// Authenticate request
+	token, ok := s.requireAuth(w, r)
+	if !ok {
+		log.Printf("DEBUG: handleArtifactUploadChunk: Authentication failed.")
+		return // requireAuth writes response
+	}
+
+	s.mu.Lock()
+	uploadId, idFound := s.cacheIdToUploadId[cacheId]
+	if idFound {
+		// Look up reservation details *after* finding uploadId
+		_, reserveFound := s.reserves[uploadId]
+		s.mu.Unlock() // Unlock early if possible
+
+		if reserveFound {
+			// Re-lock briefly to check token ownership
+			s.mu.Lock()
+			reserve := s.reserves[uploadId] // Assume it still exists
+			tokenMatches := reserve.Token == token
+			s.mu.Unlock()
+
+			if tokenMatches {
+				// Proceed with upload
+				log.Printf("DEBUG: handleArtifactUploadChunk: Handling chunk for CacheId=%d (UploadId=%s)", cacheId, uploadId)
+				partsDir := filepath.Join(s.storageDir, uploadId)
+				if err := os.MkdirAll(partsDir, 0755); err != nil {
+					log.Printf("ERROR: handleArtifactUploadChunk: Failed to create directory %s: %v", partsDir, err)
+					writeTwirpError(w, "internal", "Internal server error: failed to prepare storage", http.StatusInternalServerError)
+					return
+				}
+				// Append to a single part file
+				partPath := filepath.Join(partsDir, "data.part")
+				f, err := os.OpenFile(partPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					log.Printf("ERROR: handleArtifactUploadChunk: Failed to open/create part file %s for append: %v", partPath, err)
+					writeTwirpError(w, "internal", "Internal server error: failed to open part file", http.StatusInternalServerError)
+					return
+				}
+				defer f.Close()
+
+				log.Printf("DEBUG: handleArtifactUploadChunk: Appending request body to %s...", partPath)
+				startTime := time.Now()
+				bytesWritten, err := io.Copy(f, r.Body)
+				duration := time.Since(startTime)
+
+				if err != nil {
+					log.Printf("ERROR: handleArtifactUploadChunk: Failed to copy request body to %s: %v", partPath, err)
+					writeTwirpError(w, "internal", "Internal server error: failed to write part file", http.StatusInternalServerError)
+					return
+				}
+				log.Printf("INFO: handleArtifactUploadChunk: Appended %d bytes to %s in %v (CacheId=%d)", bytesWritten, partPath, duration, cacheId)
+				w.WriteHeader(http.StatusOK)
+				log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
+				return
+
+			} else {
+				log.Printf("WARN: handleArtifactUploadChunk: Token mismatch for CacheId %d (UploadId %s). Request token %s... != Reserved token %s...",
+					cacheId, uploadId, truncateToken(token), truncateToken(reserve.Token))
+				writeTwirpError(w, "permission_denied", "Forbidden: Token does not match reservation owner", http.StatusForbidden)
+				return
+			}
+		} else {
+			// ID found in map, but reserve record missing (already committed or cleaned up?)
+			log.Printf("WARN: handleArtifactUploadChunk: Found mapping for CacheId %d to UploadId %s, but reservation record is missing.", cacheId, uploadId)
+			writeTwirpError(w, "not_found", "Upload session not found or already completed", http.StatusNotFound)
+			return
+		}
+	} else {
+		s.mu.Unlock() // Unlock if id not found
+		log.Printf("WARN: handleArtifactUploadChunk: No upload session found for CacheId %d", cacheId)
+		writeTwirpError(w, "not_found", "Upload session not found", http.StatusNotFound)
+		return
+	}
+}
+
+// artifactCommitRequest defines JSON body for the artifact commit API.
+type artifactCommitRequest struct {
+	Size int64 `json:"size"` // Expect final size in commit request
+}
+
+// handleArtifactCommit handles POST /artifactcache/{cacheId}/commit to finalize the cache
+func (s *server) handleArtifactCommit(w http.ResponseWriter, r *http.Request, cacheId int64) {
+	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
+
+	// Authenticate request
+	token, ok := s.requireAuth(w, r)
+	if !ok {
+		log.Printf("DEBUG: handleArtifactCommit: Authentication failed.")
+		return // requireAuth writes response
+	}
+
+	// Decode commit request body (expecting size)
+	var req artifactCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("WARN: handleArtifactCommit: Failed to decode commit request body for CacheId %d: %v", cacheId, err)
+		writeTwirpError(w, "invalid_argument", "Invalid commit request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Size <= 0 {
+		log.Printf("WARN: handleArtifactCommit: Invalid size %d in commit request for CacheId %d", req.Size, cacheId)
+		writeTwirpError(w, "invalid_argument", "Invalid size in commit request", http.StatusBadRequest)
+		return
+	}
+	log.Printf("DEBUG: handleArtifactCommit: Decoded commit request for CacheId=%d: Size=%d", cacheId, req.Size)
+
+	// --- Reservation Lookup & Ownership Check ---
+	s.mu.Lock()
+	uploadId, idFound := s.cacheIdToUploadId[cacheId]
+	if !idFound {
+		s.mu.Unlock()
+		log.Printf("WARN: handleArtifactCommit: No upload session found mapping for CacheId %d", cacheId)
+		writeTwirpError(w, "not_found", "Upload session not found", http.StatusNotFound)
+		return
+	}
+
+	reserve, reserveFound := s.reserves[uploadId]
+	if !reserveFound {
+		s.mu.Unlock()
+		// Check if already committed (using uploadId for lookup in byUpload)
+		s.mu.Lock()
+		_, alreadyCommitted := s.byUpload[uploadId]
+		s.mu.Unlock()
+		if alreadyCommitted {
+			log.Printf("INFO: handleArtifactCommit: UploadId %s (CacheId %d) was already committed. Responding OK.", uploadId, cacheId)
+			w.WriteHeader(http.StatusOK)
+			log.Printf("DEBUG: << Response END: %s %s Status: %d (Already Committed)", r.Method, r.URL.Path, http.StatusOK)
+			return
+		}
+		// If not committed and reserve not found, it's an error
+		log.Printf("WARN: handleArtifactCommit: Found mapping for CacheId %d to UploadId %s, but reservation record is missing and not committed.", cacheId, uploadId)
+		writeTwirpError(w, "not_found", "Upload session not found or expired", http.StatusNotFound)
+		return
+	}
+
+	// Check ownership
+	if reserve.Token != token {
+		s.mu.Unlock()
+		log.Printf("WARN: handleArtifactCommit: Token mismatch for CacheId %d (UploadId %s). Request token %s... != Reserved token %s...",
+			cacheId, uploadId, truncateToken(token), truncateToken(reserve.Token))
+		writeTwirpError(w, "permission_denied", "Forbidden: Token does not match reservation owner", http.StatusForbidden)
+		return
+	}
+
+	// Check user exists for quota (user object needed)
+	user, userFound := s.tokens[token]
+	if !userFound {
+		s.mu.Unlock()
+		log.Printf("ERROR: handleArtifactCommit: Token %s... passed auth but not found during commit!", truncateToken(token))
+		writeTwirpError(w, "internal", "Internal server error: user token inconsistency", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("DEBUG: handleArtifactCommit: Token ownership verified for CacheId %d (UploadId %s)", cacheId, uploadId)
+
+	// --- Quota check based on *committed* size --- (User and reserve info available)
+	log.Printf("DEBUG: handleArtifactCommit: Checking final quota for token %s... (Quota: %d B, Used: %d B, Commit Size: %d B)", truncateToken(token), user.Quota, user.Used, req.Size)
+	// Per-file size limit check
+	if req.Size > user.Quota {
+		s.mu.Unlock()
+		msg := fmt.Sprintf(
+			"Committed cache size of %d B (~%d MB) exceeds user quota of %d B (~%d MB)",
+			req.Size, req.Size/(1024*1024), user.Quota, user.Quota/(1024*1024))
+		log.Printf("WARN: handleArtifactCommit: Quota exceeded (final file size): %s", msg)
+		writeTwirpError(w, "resource_exhausted", msg, http.StatusBadRequest) // Use resource_exhausted code? 400 still appropriate.
+		// TODO: Consider initiating cleanup of the uploaded data part file?
+		return
+	}
+	// Cumulative usage limit check
+	if user.Used+req.Size > user.Quota {
+		s.mu.Unlock()
+		msg := fmt.Sprintf(
+			"Quota exceeded: current usage %d B (~%d MB) + committed %d B (~%d MB) > quota %d B (~%d MB)",
+			user.Used, user.Used/(1024*1024), req.Size, req.Size/(1024*1024), user.Quota, user.Quota/(1024*1024))
+		log.Printf("WARN: handleArtifactCommit: Quota exceeded (final cumulative): %s", msg)
+		writeTwirpError(w, "resource_exhausted", msg, http.StatusBadRequest)
+		// TODO: Consider cleanup
+		return
+	}
+	log.Printf("DEBUG: handleArtifactCommit: Final quota check passed for token %s...", truncateToken(token))
+
+	// --- Finalize the archive (Rename temp part file) --- Requires lock until state updated
+	partsDir := filepath.Join(s.storageDir, uploadId)
+	tempPartFile := filepath.Join(partsDir, "data.part")
+
+	// Determine final path
+	fileExtension := ".tar.gz"
+	if reserve.Compression == "zstd" {
+		fileExtension = ".tar.zst"
+	}
+	// Use CacheId in final filename? Or stick with UploadId? Sticking with UploadId for consistency with download path.
+	finalFilename := fmt.Sprintf("%s-%s-%s%s", sanitizeFilename(reserve.Key), sanitizeFilename(reserve.Version), uploadId, fileExtension)
+	finalPath := filepath.Join(s.storageDir, finalFilename)
+	log.Printf("DEBUG: handleArtifactCommit: Finalizing archive for CacheId=%d. Renaming %s to %s", cacheId, tempPartFile, finalPath)
+
+	if err := os.Rename(tempPartFile, finalPath); err != nil {
+		s.mu.Unlock()
+		log.Printf("ERROR: handleArtifactCommit: Failed to rename temp part file %s to %s: %v", tempPartFile, finalPath, err)
+		// Attempt to remove the potentially corrupted temp file
+		_ = os.Remove(tempPartFile)
+		writeTwirpError(w, "internal", "Internal server error: failed to finalize archive file", http.StatusInternalServerError)
+		return
+	}
+
+	// Verify final size? Stat the renamed file
+	fileInfo, err := os.Stat(finalPath)
+	if err != nil {
+		s.mu.Unlock()
+		log.Printf("ERROR: handleArtifactCommit: Failed to stat final archive file %s after rename: %v", finalPath, err)
+		// File might be corrupted or gone, try to remove it and fail commit
+		_ = os.Remove(finalPath)
+		writeTwirpError(w, "internal", "Internal server error: failed to verify archive file size", http.StatusInternalServerError)
+		return
+	}
+	actualSize := fileInfo.Size()
+	if actualSize != req.Size {
+		// Size mismatch: Log warning but proceed? Or fail?
+		// Let's log a warning and proceed, using the client-reported size for quota/metadata.
+		log.Printf("WARN: handleArtifactCommit: Final archive size %d bytes does not match committed size %d bytes for CacheId %d (UploadId %s). Using committed size for metadata.", actualSize, req.Size, cacheId, uploadId)
+	}
+
+	log.Printf("INFO: handleArtifactCommit: Successfully finalized archive %s (%d bytes) for CacheId %d", finalPath, actualSize, cacheId)
+
+	// --- Update Cache State --- (Still holding lock)
+	origin := baseURL(r)
+	// Download URL uses uploadId, consistent with byUpload map key
+	downloadURL := fmt.Sprintf("%s/download/%s", origin, uploadId)
+	entry := &cacheEntry{
+		Key:             reserve.Key,
+		Version:         reserve.Version,
+		RunId:           reserve.RunId, // Retain RunId if originally provided
+		CacheId:         reserve.CacheId,
+		ArchivePath:     finalPath,
+		ArchiveLocation: downloadURL,
+		CreationTime:    time.Now().UTC(),
+		Compression:     reserve.Compression,
+		Size:            req.Size, // Use client-reported size
+	}
+	compositeKey := reserve.Key + "|" + reserve.Version
+
+	// Add to main cache map
+	s.caches[compositeKey] = entry
+	// Add to lookup map for downloads
+	s.byUpload[uploadId] = entry
+	// Update token usage
+	user.Used += req.Size // User var already fetched and verified
+	// Remove the reservation record and ID mapping
+	delete(s.reserves, uploadId)
+	delete(s.cacheIdToUploadId, cacheId)
+
+	log.Printf("DEBUG: handleArtifactCommit: Updated token %s... usage. New Used: %d B", truncateToken(token), user.Used)
+	s.mu.Unlock() // RELEASE LOCK after all state updates
+	log.Printf("DEBUG: handleArtifactCommit: Released lock after committing state")
+
+	log.Printf("INFO: handleArtifactCommit: Committed cache: CacheId=%d, Key='%s', Version='%s', Size=%d, Path=%s, Compression='%s'",
+		entry.CacheId, entry.Key, entry.Version, req.Size, entry.ArchivePath, entry.Compression)
+
+	// --- Cleanup Upload Parts Directory --- (Could be done async)
+	log.Printf("DEBUG: handleArtifactCommit: Attempting to remove parts directory: %s", partsDir)
+	if err := os.RemoveAll(partsDir); err != nil {
+		// Just log warning, commit succeeded otherwise
+		log.Printf("WARN: handleArtifactCommit: Failed to remove parts directory %s after commit: %v", partsDir, err)
+	} else {
+		log.Printf("DEBUG: handleArtifactCommit: Successfully removed parts directory %s", partsDir)
+	}
+
+	// Respond OK
+	w.WriteHeader(http.StatusOK)
+	log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusOK)
+}
+
+// handleGetCache implements GET /cache?keys=...&version=... (cache lookup)
+// Re-enabled as the route registration still exists.
+func (s *server) handleGetCache(w http.ResponseWriter, r *http.Request) {
+	log.Printf("DEBUG: >> Request START: %s %s (Remote: %s)", r.Method, r.URL.Path, r.RemoteAddr)
+	if r.Method != "GET" {
+		log.Printf("WARN: handleGetCache: Method %s not allowed, expected GET for %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Authenticate request
+	token, ok := s.requireAuth(w, r)
+	if !ok {
+		log.Printf("DEBUG: handleGetCache: Authentication failed.")
+		log.Printf("DEBUG: << Response END: %s %s Status: %d (Unauthorized)", r.Method, r.URL.Path, http.StatusUnauthorized)
+		return
+	}
+	log.Printf("DEBUG: handleGetCache: Authentication successful for token prefix %s...", truncateToken(token))
+
+	keysParam := r.URL.Query().Get("keys")
+	version := r.URL.Query().Get("version")
+	if keysParam == "" || version == "" {
+		log.Printf("WARN: handleGetCache: Missing required query parameters 'keys' and/or 'version'. Keys: '%s', Version: '%s'", keysParam, version)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errorResponse{Message: "Missing required query parameters: keys, version"})
+		log.Printf("DEBUG: << Response END: %s %s Status: %d", r.Method, r.URL.Path, http.StatusBadRequest)
+		return
+	}
+
+	keys := strings.Split(keysParam, ",")
+	log.Printf("DEBUG: handleGetCache: Looking for cache with Keys=%v, Version=%s", keys, version)
+
+	s.mu.Lock()
+	log.Printf("DEBUG: handleGetCache: Acquired lock for cache lookup")
+	defer s.mu.Unlock() // Use defer for safety within the loop/return
+	log.Printf("DEBUG: handleGetCache: Checking %d potential keys against %d cache entries", len(keys), len(s.caches))
+
+	for _, k := range keys {
+		trimmedKey := strings.TrimSpace(k)
+		if trimmedKey == "" {
+			continue
+		}
+		comp := trimmedKey + "|" + version
+		log.Printf("DEBUG: handleGetCache: Checking composite key: %s", comp)
+		if e, found := s.caches[comp]; found {
+			log.Printf("INFO: handleGetCache: Cache HIT for Key='%s', Version='%s'. Composite: %s. CacheId: %d, Location: %s",
+				trimmedKey, version, comp, e.CacheId, e.ArchiveLocation)
+			resp := struct {
+				CacheId         int64  `json:"cacheId"`
+				ArchiveLocation string `json:"archiveLocation"`
+				CacheKey        string `json:"cacheKey"`
+				CacheVersion    string `json:"cacheVersion"`
+				Scope           string `json:"scope"`
+				CreationTime    string `json:"creationTime"`
+				Compression     string `json:"compression"`
+				Size            int64  `json:"size,omitempty"`
+			}{
+				CacheId:         e.CacheId,
+				ArchiveLocation: e.ArchiveLocation,
+				CacheKey:        e.Key,
+				CacheVersion:    e.Version,
+				Scope:           "",
+				CreationTime:    e.CreationTime.Format(time.RFC3339),
+				Compression:     e.Compression,
+				Size:            e.Size,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+			log.Printf("DEBUG: handleGetCache: Responded with cache hit details.")
+			log.Printf("DEBUG: << Response END: %s %s Status: %d (Cache Hit)", r.Method, r.URL.Path, http.StatusOK)
+			return // Found a match, return immediately
+		} else {
+			log.Printf("DEBUG: handleGetCache: Cache MISS for composite key: %s", comp)
+		}
+	}
+
+	// If loop completes without finding a match
+	log.Printf("INFO: handleGetCache: Cache MISS for all requested Keys=%v, Version=%s", keys, version)
+	w.WriteHeader(http.StatusNoContent) // 204 No Content indicates cache miss
+	log.Printf("DEBUG: << Response END: %s %s Status: %d (Cache Miss)", r.Method, r.URL.Path, http.StatusNoContent)
+}
