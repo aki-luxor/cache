@@ -84,7 +84,7 @@ function checkKey(key) {
  * @returns boolean return true if Actions cache service feature is available, otherwise false
  */
 function isFeatureAvailable() {
-    return !!process.env['TENKI_CACHE_URL'];
+    return !!process.env['ACTIONS_CACHE_URL'];
 }
 exports.isFeatureAvailable = isFeatureAvailable;
 /**
@@ -136,7 +136,6 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
         }
         const compressionMethod = yield utils.getCompressionMethod();
         let archivePath = '';
-        let cacheLocation = '';
         try {
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
@@ -154,7 +153,6 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
             // Download the cache from the cache entry
-            cacheLocation = cacheEntry.archiveLocation;
             yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, archivePath, options);
             if (core.isDebug()) {
                 yield (0, tar_1.listTar)(archivePath, compressionMethod);
@@ -172,9 +170,6 @@ function restoreCacheV1(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
-                if (error.message.includes('Invalid URL')) {
-                    core.debug(`Cache URL: ${cacheLocation}`);
-                }
                 core.warning(`Failed to restore: ${error.message}`);
             }
         }
@@ -215,7 +210,6 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             checkKey(key);
         }
         let archivePath = '';
-        let cacheUrl = '';
         try {
             const twirpClient = cacheTwirpClient.internalCacheTwirpClient();
             const compressionMethod = yield utils.getCompressionMethod();
@@ -237,7 +231,6 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             archivePath = path.join(yield utils.createTempDirectory(), utils.getCacheFileName(compressionMethod));
             core.debug(`Archive path: ${archivePath}`);
             core.debug(`Starting download of archive to: ${archivePath}`);
-            cacheUrl = response.signedDownloadUrl;
             yield cacheHttpClient.downloadCache(response.signedDownloadUrl, archivePath, options);
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
@@ -255,9 +248,6 @@ function restoreCacheV2(paths, primaryKey, restoreKeys, options, enableCrossOsAr
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
-                if (error.message.includes('Invalid URL')) {
-                    core.debug(`Cache URL: ${cacheUrl}`);
-                }
                 core.warning(`Failed to restore: ${error.message}`);
             }
         }
@@ -1159,7 +1149,7 @@ function getRequestOptions() {
     return requestOptions;
 }
 function createHttpClient() {
-    const token = process.env['TENKI_RUNTIME_TOKEN'] || '';
+    const token = process.env['ACTIONS_RUNTIME_TOKEN'] || '';
     const bearerCredentialHandler = new auth_1.BearerCredentialHandler(token);
     return new http_client_1.HttpClient((0, user_agent_1.getUserAgentString)(), [bearerCredentialHandler], getRequestOptions());
 }
@@ -1562,9 +1552,9 @@ function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false)
 }
 exports.getCacheVersion = getCacheVersion;
 function getRuntimeToken() {
-    const token = process.env['TENKI_RUNTIME_TOKEN'];
+    const token = process.env['ACTIONS_RUNTIME_TOKEN'];
     if (!token) {
-        throw new Error('Unable to get the TENKI_RUNTIME_TOKEN env variable');
+        throw new Error('Unable to get the ACTIONS_RUNTIME_TOKEN env variable');
     }
     return token;
 }
@@ -1603,11 +1593,11 @@ function getCacheServiceURL() {
     // URL to use.
     switch (version) {
         case 'v1':
-            return (process.env['TENKI_CACHE_URL'] ||
-                process.env['TENKI_CACHE_URL'] ||
+            return (process.env['ACTIONS_CACHE_URL'] ||
+                process.env['ACTIONS_RESULTS_URL'] ||
                 '');
         case 'v2':
-            return process.env['TENKI_CACHE_URL'] || '';
+            return process.env['ACTIONS_RESULTS_URL'] || '';
         default:
             throw new Error(`Unsupported cache service version: ${version}`);
     }
